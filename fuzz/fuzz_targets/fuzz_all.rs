@@ -3,16 +3,16 @@
 // Copyright 2016-2025, Johann Tuffe.
 
 #![no_main]
+use calamine::{open_workbook, Reader, Xlsx};
 use libfuzzer_sys::fuzz_target;
-use calamine::{Xlsx, open_workbook, Reader};
-use std::io::Write;
 use std::fs::File;
+use std::io::Write;
 
 fuzz_target!(|data: &[u8]| {
     let file_name = "fuzz.xlsx";
     if let Ok(mut file) = File::create(file_name) {
         if file.write_all(data).is_err() {
-            return
+            return;
         }
     }
     let mut workbook: Xlsx<_> = match open_workbook(file_name) {
@@ -21,8 +21,8 @@ fuzz_target!(|data: &[u8]| {
     };
     for worksheet in workbook.worksheets() {
         if let Ok(range) = workbook.worksheet_range(&worksheet.0) {
-           let _ = range.get_size().0 * range.get_size().1;
-           range.used_cells().count();
+            let _ = range.get_size().0 * range.get_size().1;
+            range.used_cells().count();
         }
     }
     if let Ok(Some(vba)) = workbook.vba_project() {
@@ -37,7 +37,10 @@ fuzz_target!(|data: &[u8]| {
     let sheets = workbook.sheet_names().to_owned();
     for s in sheets {
         if let Ok(formula) = workbook.worksheet_formula(&s) {
-            formula.rows().flat_map(|r| r.iter().filter(|f| !f.is_empty())).count();
+            formula
+                .rows()
+                .flat_map(|r| r.iter().filter(|f| !f.is_empty()))
+                .count();
         }
     }
 });

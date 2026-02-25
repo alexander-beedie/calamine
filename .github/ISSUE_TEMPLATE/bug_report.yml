@@ -7,30 +7,29 @@ title: "Bug: add a description here"
 labels: [bug]
 
 body:
+  - type: markdown
+    attributes:
+      value: Please fill in the title above and the sections below to submit your bug report.
 
-- type: markdown
-  attributes:
-    value: Please fill in the title above and the sections below to submit your bug report.
+  - type: textarea
+    attributes:
+      label: Current behavior
+      description: A description of what you're experiencing.
+    validations:
+      required: true
 
-- type: textarea
-  attributes:
-    label: Current behavior
-    description: A description of what you're experiencing.
-  validations:
-    required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+      description: A description of what you expected to happen.
+    validations:
+      required: true
 
-- type: textarea
-  attributes:
-    label: Expected behavior
-    description: A description of what you expected to happen.
-  validations:
-    required: true
-
-- type: textarea
-  attributes:
-    label: Sample code to reproduce
-    description: Please add a small, complete, sample program that demonstrates your issue.
-    value: |
+  - type: textarea
+    attributes:
+      label: Sample code to reproduce
+      description: Please add a small, complete, sample program that demonstrates your issue.
+      value: |
         ```
         use calamine::{open_workbook, Error, Reader, Xlsx};
 
@@ -54,45 +53,45 @@ body:
             }
         }
         ```
-    render: rust
-  validations:
-    required: true
+      render: rust
+    validations:
+      required: true
 
-- type: textarea
-  attributes:
-    label: Test file
-    description: >
-      Please attach the test file that you used in the sample code above. If you
-      are unable to share the original file, please create a minimal test file
-      that reproduces the issue.
+  - type: textarea
+    attributes:
+      label: Test file
+      description: >
+        Please attach the test file that you used in the sample code above. If you
+        are unable to share the original file, please create a minimal test file
+        that reproduces the issue.
 
 
-      Tip: You can attach files by clicking this area to highlight it and then
-      dragging files in.
-  validations:
-    required: true
+        Tip: You can attach files by clicking this area to highlight it and then
+        dragging files in.
+    validations:
+      required: true
 
-- type: textarea
-  attributes:
-    label: Environment
-    description: |
-      Add any relevant version or system information:
-    value: |
+  - type: textarea
+    attributes:
+      label: Environment
+      description: |
+        Add any relevant version or system information:
+      value: |
         - calamine version:
         - Cargo.toml dependency line for calamine:
         - rustc version:
         - Excel/OpenOffice/LibreOffice version:
         - OS:
-    render: text
-  validations:
-    required: false
-
-- type: checkboxes
-  attributes:
-    label: Checklist
-    description: >
-      Ensure that the following have been included.
-    options:
-    - label: I have added a complete sample program that compiles in Rust.
-    - label: I have added a test file.
+      render: text
+    validations:
       required: false
+
+  - type: checkboxes
+    attributes:
+      label: Checklist
+      description: >
+        Ensure that the following have been included.
+      options:
+        - label: I have added a complete sample program that compiles in Rust.
+        - label: I have added a test file.
+          required: false

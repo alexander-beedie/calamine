@@ -14,7 +14,7 @@ An Excel/OpenDocument Spreadsheets file reader/deserializer, in pure Rust.
 - excel like (`xls`, `xlsx`, `xlsm`, `xlsb`, `xla`, `xlam`)
 - opendocument spreadsheets (`ods`)
 
-As long as your files are *simple enough*, this library should just work.
+As long as your files are _simple enough_, this library should just work.
 
 ## Examples
 
@@ -181,7 +181,6 @@ for s in sheets {
 }
 ```
 
-
 ## Crate Features
 
 The following is a list of the optional features supported by the `calamine`
@@ -196,7 +195,6 @@ A `calamine` feature can be enabled in your `Cargo.toml` file as follows:
 ```bash
 cargo add calamine -F chrono
 ```
-
 
 ### Others
 
@@ -347,7 +345,7 @@ The spreadsheet has a range of 1,000,001 rows and 41 columns, for a total of 41,
 
 Going off of that number:
 
-- `calamine` =>  1,122,279 cells per second
+- `calamine` => 1,122,279 cells per second
 - `excelize` => 633,998 cells per second
 - `ClosedXML` => 157,320 cells per second
 - `openpyxl` => 117,612 cells per second
@@ -362,10 +360,11 @@ As stated, the filesize on disk is `186MB`:
 
 - `calamine` => `186MB`
 - `ClosedXML` => `208MB`.
-- `openpyxl` =>  `192MB`.
+- `openpyxl` => `192MB`.
 - `excelize` => `1.5GB`.
 
 When asking one of the maintainers of `excelize`, I got this [response](https://github.com/qax-os/excelize/issues/1695#issuecomment-1772239230):
+
 > To avoid high memory usage for reading large files, this library allows user-specific UnzipXMLSizeLimit options when opening the workbook, to set the memory limit on the unzipping worksheet and shared string table in bytes, worksheet XML will be extracted to the system temporary directory when the file size is over this value, so you can see that data written in reading mode, and you can change the default for that to avoid this behavior.
 >
 > \- xuri
@@ -381,6 +380,7 @@ As seen in the previous section, `excelize` is writing to disk to save memory. T
 ![mem_usage](https://github.com/RoloEdits/calamine/assets/12489689/c83fdf6b-1442-4e22-8eca-84cbc1db4a26)
 
 ![virt_mem_usage](https://github.com/RoloEdits/calamine/assets/12489689/840a96ed-33d7-44f7-8276-80bb7a02557f)
+
 > [!NOTE]
 > `ClosedXML` was reporting a constant `2.5TB` of virtual memory usage, so it was excluded from the chart.
 

@@ -1,0 +1,10 @@
+repos:
+  - repo: https://github.com/dprint/dprint
+    rev: "0.51.1"
+    hooks:
+      - id: dprint
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.5
+    hooks:
+      - id: typos

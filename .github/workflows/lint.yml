@@ -1,0 +1,30 @@
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  dprint:
+    name: Format with `dprint` and `rustfmt`
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Format Markdown, TOML, YAML
+        uses: dprint/check@v2.2
+      - name: Setup Rust toolchain with `rustfmt`
+        uses: [actions-rust-lang/setup-rust-toolchain@v1](https://github.com/actions-rust-lang/setup-rust-toolchain)
+        with:
+          components: rustfmt
+      - name: Format Rust code
+        run: cargo fmt --all -- --check
+
+  typos:
+    name: Spell check with `typos`
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Check spelling
+        uses: crate-ci/typos@master
+        with:
+          config: ./.typos.toml

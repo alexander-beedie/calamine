@@ -61,7 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Issue #587]: https://github.com/tafia/calamine/issues/587
 
-
 ## [0.32.0] - 2025-11-20
 
 ### Changed
@@ -87,7 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tags.
 
 - Fixed various edge cases in XLS handling that could lead to parsing errors.
-
 
 ## [0.31.0] - 2025-09-27
 
@@ -129,7 +127,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Issue #469]: https://github.com/tafia/calamine/issues/469
 
-
 ## [0.30.1] - 2025-09-06
 
 ### Added
@@ -145,7 +142,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   [Issue #548]: https://github.com/tafia/calamine/issues/548
 
-
 ## [0.30.0] - 2025-08-07
 
 ### Changed
@@ -159,7 +155,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See the discussion at [Issue #527].
 
   [Issue #527]: https://github.com/tafia/calamine/issues/527
-
 
 ## [0.29.0] - 2025-07-17
 
@@ -538,7 +533,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Ods, support *text:s* and *text:p*.
+- Ods, support _text:s_ and _text:p_.
 
 ## [0.14.6] - 2018-09-20
 
