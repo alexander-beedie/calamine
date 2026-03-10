@@ -3,7 +3,7 @@
 // Copyright 2016-2025, Johann Tuffe.
 
 use std::cmp::min;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -16,7 +16,9 @@ use crate::formats::{
 };
 #[cfg(feature = "picture")]
 use crate::utils::read_usize;
-use crate::utils::{push_column, read_f64, read_i16, read_i32, read_u16, read_u32};
+use crate::utils::{
+    push_column, read_f64, read_i16, read_i32, read_u16, read_u32, resolve_rel_ref, write_cell_ref,
+};
 use crate::vba::VbaProject;
 use crate::{
     Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, Sheet, SheetType,
@@ -451,6 +453,28 @@ impl<RS: Read + Seek> Xls<RS> {
             let mut formulas = Vec::new();
             let mut fmla_pos = (0, 0);
             let mut merge_cells = Vec::new();
+            // Shared formula storage: host cell (row, col) -> raw formula token data
+            let mut shared_formulas: HashMap<(u32, u32), &[u8]> = HashMap::new();
+            // PtgExp cells pending resolution: (cell_pos, host_pos)
+            let mut ptgexp_cells: Vec<((u32, u32), (u32, u32))> = Vec::new();
+            let parse_fmla =
+                |data: &[u8], pos: (u32, u32), cell_pos: Option<(u32, u32)>| -> String {
+                    parse_formula(
+                        data,
+                        &fmla_sheet_names,
+                        &defined_names,
+                        &xtis,
+                        &encoding,
+                        cell_pos,
+                    )
+                    .unwrap_or_else(|e| {
+                        debug!("{e}");
+                        format!(
+                            "Unrecognised formula for cell ({}, {}): {e:?}",
+                            pos.0, pos.1
+                        )
+                    })
+                };
             for record in records {
                 let r = record?;
                 match r.typ {
@@ -492,23 +516,40 @@ impl<RS: Read + Seek> Xls<RS> {
                             // it will appear in 0x0207 record coming next
                             cells.push(Cell::new(fmla_pos, val));
                         }
-                        let fmla = parse_formula(
-                            &r.data[20..],
-                            &fmla_sheet_names,
-                            &defined_names,
-                            &xtis,
-                            &encoding,
-                        )
-                        .unwrap_or_else(|e| {
-                            debug!("{e}");
-                            format!(
-                                "Unrecognised formula \
-                                 for cell ({row}, {col}): {e:?}"
-                            )
-                        });
-                        formulas.push(Cell::new(fmla_pos, fmla));
+                        // Check if this formula is a PtgExp reference
+                        let fmla_data = &r.data[20..];
+                        if let Some(host_pos) = find_ptgexp(fmla_data) {
+                            ptgexp_cells.push((fmla_pos, host_pos));
+                        } else {
+                            formulas
+                                .push(Cell::new(fmla_pos, parse_fmla(fmla_data, fmla_pos, None)));
+                        }
+                    }
+                    // 1212: ShrFmla (Shared Formula) [MS-XLS 2.4.260]
+                    // Layout: rwFirst(2) + rwLast(2) + colFirst(1) + colLast(1) +
+                    //         reserved(2) + cce(2) + rgce(cce)
+                    0x04BC => {
+                        if r.data.len() >= 10 {
+                            shared_formulas.insert(fmla_pos, &r.data[8..]);
+                        }
+                    }
+                    // 545: Array (Array Formula) [MS-XLS 2.4.4]
+                    // Layout: ref8(8) + fAlwaysCalc(2) + reserved(2) + cce(2) + rgce(cce)
+                    0x0221 => {
+                        if r.data.len() >= 14 {
+                            shared_formulas.insert(fmla_pos, &r.data[12..]);
+                        }
                     }
                     _ => (),
+                }
+            }
+            // Resolve PtgExp references using stored shared/array formulas
+            for (cell_pos, host_pos) in ptgexp_cells {
+                if let Some(token_data) = shared_formulas.get(&host_pos) {
+                    formulas.push(Cell::new(
+                        cell_pos,
+                        parse_fmla(token_data, cell_pos, Some(cell_pos)),
+                    ));
                 }
             }
             let range = Range::from_sparse(cells);
@@ -1275,15 +1316,46 @@ fn parse_defined_names(rgce: &[u8], biff: Biff) -> Result<(Option<usize>, String
     Ok(res)
 }
 
+/// Check if a formula record's token data contains a PtgExp (shared/array formula reference).
+/// Returns the host cell (row, col) if found.
+/// The data starts with a 2-byte cce (token length), then the token bytes.
+#[inline]
+fn find_ptgexp(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 7 {
+        return None;
+    }
+    let cce = read_u16(data) as usize;
+    if cce < 5 || data.len() < 2 + cce {
+        return None;
+    }
+    let tokens = &data[2..2 + cce];
+    let mut pos = 0;
+    // Skip any leading PtgAttrSpace (0x19) tokens (1 byte ptg + 3 bytes data).
+    while pos + 4 <= tokens.len() && tokens[pos] == 0x19 {
+        pos += 4;
+    }
+    if pos + 5 <= tokens.len() && tokens[pos] == 0x01 {
+        let host_row = read_u16(&tokens[pos + 1..]) as u32;
+        let host_col = read_u16(&tokens[pos + 3..]) as u32;
+        Some((host_row, host_col))
+    } else {
+        None
+    }
+}
+
 /// Formula parsing
 ///
 /// `CellParsedFormula` [MS-XLS 2.5.198.3]
+///
+/// `cell_pos` is the position of the cell being evaluated; required for resolving
+/// PtgRefN/PtgAreaN relative references in shared formulas, `None` otherwise.
 fn parse_formula(
     mut rgce: &[u8],
     sheets: &[String],
     names: &[(String, String)],
     xtis: &[Xti],
     encoding: &XlsEncoding,
+    cell_pos: Option<(u32, u32)>,
 ) -> Result<String, XlsError> {
     let mut stack = Vec::new();
     let mut formula = String::with_capacity(rgce.len());
@@ -1349,8 +1421,7 @@ fn parse_formula(
                 rgce = &rgce[10..];
             }
             0x01 => {
-                // PtgExp: array/shared formula, ignore
-                debug!("ignoring PtgExp array/shared formula");
+                // PtgExp: array/shared formula (resolved by caller)
                 stack.push(formula.len());
                 rgce = &rgce[4..];
             }
@@ -1565,6 +1636,31 @@ fn parse_formula(
                 write!(&mut formula, "${}:$", read_u16(&rgce[0..2]) as u32 + 1).unwrap();
                 push_column(read_u16(&rgce[6..8]) as u32, &mut formula);
                 write!(&mut formula, "${}", read_u16(&rgce[2..4]) as u32 + 1).unwrap();
+                rgce = &rgce[8..];
+            }
+            0x2C | 0x4C | 0x6C => {
+                // PtgRefN: relative cell reference (used in shared formulas)
+                stack.push(formula.len());
+                let pos = cell_pos.unwrap_or((0, 0));
+                let (row, col, row_rel, col_rel) =
+                    resolve_rel_ref(read_u16(rgce) as i16 as i32, read_u16(&rgce[2..]), pos);
+                write_cell_ref(&mut formula, row, col, row_rel, col_rel);
+                rgce = &rgce[4..];
+            }
+            0x2D | 0x4D | 0x6D => {
+                // PtgAreaN: relative area reference (used in shared formulas)
+                stack.push(formula.len());
+                let pos = cell_pos.unwrap_or((0, 0));
+                let (r1, c1, r1_rel, c1_rel) =
+                    resolve_rel_ref(read_u16(rgce) as i16 as i32, read_u16(&rgce[4..]), pos);
+                let (r2, c2, r2_rel, c2_rel) = resolve_rel_ref(
+                    read_u16(&rgce[2..]) as i16 as i32,
+                    read_u16(&rgce[6..]),
+                    pos,
+                );
+                write_cell_ref(&mut formula, r1, c1, r1_rel, c1_rel);
+                formula.push(':');
+                write_cell_ref(&mut formula, r2, c2, r2_rel, c2_rel);
                 rgce = &rgce[8..];
             }
             0x2A | 0x4A | 0x6A => {

@@ -11,7 +11,10 @@ use crate::{
     Cell, CellErrorType, Dimensions, XlsbError,
 };
 
-use super::{cell_format, parse_formula, wide_str, RecordIter};
+use super::{cell_format, find_ptgexp, parse_formula, wide_str, RecordIter};
+
+/// Stored shared formula: (rwFirst, rwLast, colFirst, colLast, token_data).
+type ShrFmla = (u32, u32, u32, u32, Vec<u8>);
 
 /// A cells reader for xlsb files
 pub struct XlsbCellsReader<'a, RS>
@@ -28,6 +31,14 @@ where
     is_1904: bool,
     dimensions: Dimensions,
     buf: Vec<u8>,
+    /// Shared formula definitions collected during formula iteration.
+    shared_formulas: Vec<ShrFmla>,
+    /// PtgExp cells pending resolution: (cell_pos, host_row).
+    ptgexp_cells: Vec<((u32, u32), u32)>,
+    /// Resolved PtgExp formulas being drained (in reverse order, via pop()).
+    resolved: Vec<Cell<String>>,
+    /// True once BrtEndSheetData has been reached.
+    end_of_sheet: bool,
 }
 
 impl<'a, RS> XlsbCellsReader<'a, RS>
@@ -77,6 +88,10 @@ where
             typ: 0,
             row: 0,
             buf,
+            shared_formulas: Vec::new(),
+            ptgexp_cells: Vec::new(),
+            resolved: Vec::new(),
+            end_of_sheet: false,
         })
     }
 
@@ -161,50 +176,131 @@ where
         Ok(Some(Cell::new((self.row, col), value)))
     }
 
+    /// Extract the rgce token slice from a formula record buffer.
+    /// Returns the rgce slice based on the record type.
+    fn extract_rgce(&self) -> Option<&[u8]> {
+        let cce_offset = match self.typ {
+            0x0009 => 18, // BrtFmlaNum: col(4)+style(4)+value(8)+flags(2)
+            0x0008 => {
+                // BrtFmlaString: col(4)+style(4)+cch(4)+str(cch*2)+flags(2)
+                let cch = read_u32(&self.buf[8..]) as usize;
+                14 + cch * 2
+            }
+            0x000A | 0x000B => 11, // BrtFmlaBool/Error: col(4)+style(4)+val(1)+flags(2)
+            _ => return None,
+        };
+        if cce_offset + 4 > self.buf.len() {
+            return None;
+        }
+        let cce = read_u32(&self.buf[cce_offset..]) as usize;
+        let start = cce_offset + 4;
+        if start + cce > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[start..start + cce])
+    }
+
     pub fn next_formula(&mut self) -> Result<Option<Cell<String>>, XlsbError> {
+        // Drain any resolved PtgExp formulas first
+        if let Some(cell) = self.resolved.pop() {
+            return Ok(Some(cell));
+        }
+        if self.end_of_sheet {
+            return Ok(None);
+        }
+
         let value = loop {
             self.typ = self.iter.read_type()?;
             let _ = self.iter.fill_buffer(&mut self.buf)?;
 
             let value = match self.typ {
-                // 0x0001 => continue, // Data::Empty, // BrtCellBlank
-                0x0008 => {
-                    // BrtFmlaString
-                    let cch = read_u32(&self.buf[8..]) as usize;
-                    let formula = &self.buf[14 + cch * 2..];
-                    let cce = read_u32(formula) as usize;
-                    let rgce = &formula[4..4 + cce];
-                    parse_formula(rgce, self.extern_sheets, self.metadata_names)?
+                0x0008..=0x000B => {
+                    let col = read_u32(&self.buf);
+                    let cell_pos = (self.row, col);
+
+                    if let Some(rgce) = self.extract_rgce() {
+                        if let Some(host_row) = find_ptgexp(rgce) {
+                            // PtgExp: defer resolution until we've seen all BrtShrFmla records
+                            self.ptgexp_cells.push((cell_pos, host_row));
+                            continue;
+                        }
+                        parse_formula(rgce, self.extern_sheets, self.metadata_names, None)?
+                    } else {
+                        String::new()
+                    }
                 }
-                0x0009 => {
-                    // BrtFmlaNum
-                    let formula = &self.buf[18..];
-                    let cce = read_u32(formula) as usize;
-                    let rgce = &formula[4..4 + cce];
-                    parse_formula(rgce, self.extern_sheets, self.metadata_names)?
-                }
-                0x000A | 0x000B => {
-                    // BrtFmlaBool | BrtFmlaError
-                    let formula = &self.buf[11..];
-                    let cce = read_u32(formula) as usize;
-                    let rgce = &formula[4..4 + cce];
-                    parse_formula(rgce, self.extern_sheets, self.metadata_names)?
+                // BrtShrFmla: shared formula definition
+                // Layout: rwFirst(4) + rwLast(4) + colFirst(4) + colLast(4) + cce(4) + rgce(cce)
+                0x01AB => {
+                    if self.buf.len() >= 20 {
+                        let rw_first = read_u32(&self.buf[0..4]);
+                        let rw_last = read_u32(&self.buf[4..8]);
+                        let col_first = read_u32(&self.buf[8..12]);
+                        let col_last = read_u32(&self.buf[12..16]);
+                        let cce = read_u32(&self.buf[16..20]) as usize;
+                        if 20 + cce <= self.buf.len() {
+                            let tokens = self.buf[20..20 + cce].to_vec();
+                            self.shared_formulas
+                                .push((rw_first, rw_last, col_first, col_last, tokens));
+                        }
+                    }
+                    continue;
                 }
                 0x0000 => {
                     // BrtRowHdr
                     self.row = read_u32(&self.buf);
                     if self.row > 0x0010_0000 {
-                        return Ok(None); // invalid row
+                        return self.resolve_pending();
                     }
                     continue;
                 }
-                0x0092 => return Ok(None), // BrtEndSheetData
-                _ => continue, // anything else, ignore and try next, without changing idx
+                0x0092 => {
+                    // BrtEndSheetData — resolve all pending PtgExp cells
+                    return self.resolve_pending();
+                }
+                _ => continue,
             };
             break value;
         };
         let col = read_u32(&self.buf);
         Ok(Some(Cell::new((self.row, col), value)))
+    }
+
+    /// Resolve all pending PtgExp cells and start returning them.
+    fn resolve_pending(&mut self) -> Result<Option<Cell<String>>, XlsbError> {
+        self.end_of_sheet = true;
+        let pending = std::mem::take(&mut self.ptgexp_cells);
+        for (cell_pos, host_row) in pending {
+            // Find the shared formula whose range contains this cell
+            let shr =
+                self.shared_formulas
+                    .iter()
+                    .find(|(rw_first, rw_last, col_first, col_last, _)| {
+                        *rw_first == host_row
+                            && cell_pos.0 <= *rw_last
+                            && cell_pos.1 >= *col_first
+                            && cell_pos.1 <= *col_last
+                    });
+
+            if let Some((_, _, _, _, tokens)) = shr {
+                let fmla = parse_formula(
+                    tokens,
+                    self.extern_sheets,
+                    self.metadata_names,
+                    Some(cell_pos),
+                )
+                .unwrap_or_else(|e| {
+                    format!(
+                        "Unrecognised shared formula for cell ({}, {}): {e:?}",
+                        cell_pos.0, cell_pos.1
+                    )
+                });
+                self.resolved.push(Cell::new(cell_pos, fmla));
+            }
+        }
+        // Reverse so pop() yields cells in forward order
+        self.resolved.reverse();
+        Ok(self.resolved.pop())
     }
 }
 

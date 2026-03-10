@@ -13,9 +13,10 @@ use std::{
 };
 
 use super::{
-    get_attribute, get_dimension, get_row, get_row_column, read_string_with_bufs,
-    replace_cell_names, Dimensions, XlReader,
+    get_attribute, get_dimension, get_row, get_row_column, read_string_with_bufs, Dimensions,
+    XlReader,
 };
+use crate::utils::replace_cell_names;
 use crate::{
     datatype::DataRef,
     formats::{format_excel_f64_ref, CellFormat},

@@ -81,6 +81,392 @@ pub fn push_column(mut col: u32, buf: &mut String) {
     }
 }
 
+/// Write a cell reference (e.g., `$A$1`, `B2`) into the formula string.
+/// Used by XLS and XLSB shared formula resolution.
+#[inline]
+pub(crate) fn write_cell_ref(
+    formula: &mut String,
+    row: u32,
+    col: u32,
+    row_rel: bool,
+    col_rel: bool,
+) {
+    use std::fmt::Write;
+    if !col_rel {
+        formula.push('$');
+    }
+    push_column(col, formula);
+    if !row_rel {
+        formula.push('$');
+    }
+    write!(formula, "{}", row + 1).unwrap();
+}
+
+/// Resolve a PtgRefN/PtgAreaN relative reference field.
+///
+/// `row_raw` is the row field (signed offset if relative, absolute row otherwise).
+/// `col_raw` is the packed column field (bits 0-13: column offset, bit 14: row-relative,
+/// bit 15: col-relative).
+/// Returns `(absolute_row, absolute_col, row_is_relative, col_is_relative)`.
+///
+/// Used by both XLS (with i16→i32 widening) and XLSB formula parsers.
+#[inline]
+pub(crate) fn resolve_rel_ref(
+    row_raw: i32,
+    col_raw: u16,
+    cell_pos: (u32, u32),
+) -> (u32, u32, bool, bool) {
+    let col_rel = col_raw & 0x8000 != 0;
+    let row_rel = col_raw & 0x4000 != 0;
+    let row = if row_rel {
+        (cell_pos.0 as i64 + row_raw as i64) as u32
+    } else {
+        row_raw as u32
+    };
+    let col = if col_rel {
+        let offset = ((col_raw & 0x3FFF) as i16) << 2 >> 2; // sign-extend 14 bits
+        (cell_pos.1 as i32 + offset as i32) as u32
+    } else {
+        (col_raw & 0x3FFF) as u32
+    };
+    (row, col, row_rel, col_rel)
+}
+
+/// Maximum number of rows in an XLSX spreadsheet.
+/// XLS (BIFF8) supports only 65,536 rows; XLSX supports 1,048,576.
+/// Used as the upper bound for A1-style cell reference validation.
+pub(crate) const MAX_ROWS: u32 = 1_048_576;
+/// Maximum number of columns in an XLSX spreadsheet.
+/// XLS (BIFF8) supports only 256 columns; XLSX supports 16,384.
+/// Used as the upper bound for A1-style cell reference validation.
+pub(crate) const MAX_COLUMNS: u32 = 16_384;
+
+/// Errors that can occur when parsing or manipulating cell references.
+#[derive(Debug)]
+pub(crate) enum CellRefError {
+    /// Invalid character in cell reference
+    Alphanumeric(u8),
+    /// Column number exceeds maximum
+    ColumnNumberOverflow,
+    /// Row number exceeds maximum
+    RowNumberOverflow,
+    /// Unexpected error
+    Unexpected(&'static str),
+}
+
+impl std::fmt::Display for CellRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CellRefError::Alphanumeric(c) => write!(f, "Unexpected alphanumeric char: {c}"),
+            CellRefError::ColumnNumberOverflow => write!(f, "column number overflow"),
+            CellRefError::RowNumberOverflow => write!(f, "row number overflow"),
+            CellRefError::Unexpected(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// A parsed cell reference (e.g., "A1", "$A$1", "E", "5").
+#[derive(Debug)]
+pub(crate) enum Reference {
+    Cell {
+        row: u32,
+        col: u32,
+        absolute_row: bool,
+        absolute_col: bool,
+    },
+    Row {
+        row: u32,
+        absolute: bool,
+    },
+    Column {
+        col: u32,
+        absolute: bool,
+    },
+}
+
+impl Reference {
+    pub(crate) fn cell(
+        row: u32,
+        col: u32,
+        absolute_row: bool,
+        absolute_col: bool,
+    ) -> Result<Self, CellRefError> {
+        let reference = Reference::Cell {
+            row,
+            col,
+            absolute_row,
+            absolute_col,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub(crate) fn column(col: u32, absolute: bool) -> Result<Self, CellRefError> {
+        let reference = Reference::Column { col, absolute };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub(crate) fn row(row: u32, absolute: bool) -> Result<Self, CellRefError> {
+        let reference = Reference::Row { row, absolute };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Parse a reference (e.g., "A1", "$A1", "A$1", "$A$1", "E", "$E", "5", "$5").
+    pub(crate) fn parse(name: &[u8]) -> Result<Self, CellRefError> {
+        let mut iter = name.iter().peekable();
+        let mut col: u32 = 0;
+        let mut row: u32 = 0;
+        let mut absolute_col = false;
+        let mut absolute_row = false;
+
+        while let Some(&c) = iter.next() {
+            match (c, iter.peek()) {
+                (b'$', Some(b'A'..=b'Z' | b'a'..=b'z')) => {
+                    if row > 0 || col > 0 {
+                        return Err(CellRefError::Alphanumeric(c));
+                    }
+                    absolute_col = true;
+                }
+                (b'$', Some(b'0'..=b'9')) => {
+                    if row > 0 {
+                        return Err(CellRefError::Alphanumeric(c));
+                    }
+                    absolute_row = true;
+                }
+                (b'$', _) => return Err(CellRefError::Alphanumeric(c)),
+                (c @ (b'A'..=b'Z' | b'a'..=b'z'), _) => {
+                    if row > 0 {
+                        return Err(CellRefError::Alphanumeric(c));
+                    }
+                    col = col
+                        .wrapping_mul(26)
+                        .wrapping_add((c.to_ascii_uppercase() - b'A') as u32 + 1);
+                }
+                (c @ b'0'..=b'9', _) => {
+                    row = row.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+                }
+                _ => return Err(CellRefError::Alphanumeric(c)),
+            }
+        }
+
+        match (col.checked_sub(1), row.checked_sub(1)) {
+            (Some(col), Some(row)) => Reference::cell(row, col, absolute_row, absolute_col),
+            (Some(col), None) => Reference::column(col, absolute_col),
+            (None, Some(row)) => Reference::row(row, absolute_row),
+            (None, None) => Err(CellRefError::Unexpected("Empty reference")),
+        }
+    }
+
+    /// Apply offset to create a new reference with validation.
+    pub(crate) fn offset(self, offset: (i64, i64)) -> Result<Self, CellRefError> {
+        let result = match self {
+            Reference::Cell {
+                row,
+                col,
+                absolute_row,
+                absolute_col,
+            } => {
+                let new_col = if absolute_col {
+                    col
+                } else {
+                    (col as i64 + offset.1) as u32
+                };
+                let new_row = if absolute_row {
+                    row
+                } else {
+                    (row as i64 + offset.0) as u32
+                };
+                Reference::Cell {
+                    row: new_row,
+                    col: new_col,
+                    absolute_row,
+                    absolute_col,
+                }
+            }
+            Reference::Column { col, absolute } => {
+                let new_col = if absolute {
+                    col
+                } else {
+                    (col as i64 + offset.1) as u32
+                };
+                Reference::Column {
+                    col: new_col,
+                    absolute,
+                }
+            }
+            Reference::Row { row, absolute } => {
+                let new_row = if absolute {
+                    row
+                } else {
+                    (row as i64 + offset.0) as u32
+                };
+                Reference::Row {
+                    row: new_row,
+                    absolute,
+                }
+            }
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    fn validate(&self) -> Result<(), CellRefError> {
+        match self {
+            Reference::Cell { row, col, .. } => {
+                if *col >= MAX_COLUMNS {
+                    return Err(CellRefError::ColumnNumberOverflow);
+                }
+                if *row >= MAX_ROWS {
+                    return Err(CellRefError::RowNumberOverflow);
+                }
+                Ok(())
+            }
+            Reference::Column { col, .. } => {
+                if *col >= MAX_COLUMNS {
+                    return Err(CellRefError::ColumnNumberOverflow);
+                }
+                Ok(())
+            }
+            Reference::Row { row, .. } => {
+                if *row >= MAX_ROWS {
+                    return Err(CellRefError::RowNumberOverflow);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Format a reference to bytes.
+    pub(crate) fn format(&self, buf: &mut Vec<u8>) -> Result<(), CellRefError> {
+        match self {
+            Reference::Cell {
+                row,
+                col,
+                absolute_row,
+                absolute_col,
+            } => {
+                if *absolute_col {
+                    buf.push(b'$');
+                }
+                column_number_to_name(*col, buf)?;
+                if *absolute_row {
+                    buf.push(b'$');
+                }
+                buf.extend((row + 1).to_string().into_bytes());
+                Ok(())
+            }
+            Reference::Column { col, absolute } => {
+                if *absolute {
+                    buf.push(b'$');
+                }
+                column_number_to_name(*col, buf)
+            }
+            Reference::Row { row, absolute } => {
+                if *absolute {
+                    buf.push(b'$');
+                }
+                buf.extend((row + 1).to_string().into_bytes());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Convert the integer to Excel column title (0-based).
+pub(crate) fn column_number_to_name(num: u32, buf: &mut Vec<u8>) -> Result<(), CellRefError> {
+    if num >= MAX_COLUMNS {
+        return Err(CellRefError::ColumnNumberOverflow);
+    }
+    let start = buf.len();
+    let mut num = num + 1;
+    while num > 0 {
+        let integer = ((num - 1) % 26 + 65) as u8;
+        buf.push(integer);
+        num = (num - 1) / 26;
+    }
+    buf[start..].reverse();
+    Ok(())
+}
+
+/// Advance a reference by the offset (e.g., "A1", "E:F", "5:6", "A1:B5").
+pub(crate) fn offset_range(
+    range: &[u8],
+    offset: (i64, i64),
+    buf: &mut Vec<u8>,
+) -> Result<(), CellRefError> {
+    let colon_pos = range.iter().position(|&b| b == b':');
+
+    match colon_pos {
+        None => {
+            let reference = Reference::parse(range)?;
+            if !matches!(reference, Reference::Cell { .. }) {
+                return Err(CellRefError::Unexpected(
+                    "Single reference type must be cell",
+                ));
+            }
+            let offset_ref = reference.offset(offset)?;
+            offset_ref.format(buf)
+        }
+        Some(idx) => {
+            let start = &range[..idx];
+            let end = &range[idx + 1..];
+
+            let start_ref = Reference::parse(start)?;
+            let end_ref = Reference::parse(end)?;
+
+            if std::mem::discriminant(&start_ref) != std::mem::discriminant(&end_ref) {
+                return Err(CellRefError::Unexpected("Range type mismatch"));
+            }
+
+            let start_offset = start_ref.offset(offset)?;
+            let end_offset = end_ref.offset(offset)?;
+
+            start_offset.format(buf)?;
+            buf.push(b':');
+            end_offset.format(buf)
+        }
+    }
+}
+
+/// Advance all valid cell names in the string by the offset.
+pub(crate) fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, CellRefError> {
+    let bytes = s.as_bytes();
+    let mut res: Vec<u8> = Vec::new();
+    let mut in_quote = false;
+
+    let mut token_start = 0;
+    let mut token_end = 0;
+
+    for (i, &c) in bytes.iter().enumerate() {
+        if !in_quote && (c.is_ascii_alphanumeric() || c == b'$' || c == b':') {
+            token_end = i + 1;
+        } else {
+            if token_start < token_end
+                && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
+            {
+                res.extend(&bytes[token_start..token_end]);
+            }
+            res.push(c);
+            token_start = i + 1;
+            token_end = i + 1;
+
+            if c == b'"' {
+                in_quote = !in_quote;
+            }
+        }
+    }
+
+    if token_start < token_end
+        && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
+    {
+        res.extend(&bytes[token_start..token_end]);
+    }
+
+    String::from_utf8(res).map_err(|_| CellRefError::Unexpected("fail to convert cell name"))
+}
+
 // Utility function to unescape standard XML entities or character references
 // generated by a `quick_xml::Event::GeneralRef()`. Appends the result to the
 // provided buffer or returns a `quick_xml::Error`.
@@ -1261,5 +1647,102 @@ mod tests {
         for (input, expected) in test_cases {
             assert_eq!(unescape_xml(input), expected);
         }
+    }
+
+    #[test]
+    fn test_column_number_to_name() {
+        let check = |num, expected: &[u8]| {
+            let mut buf = Vec::new();
+            column_number_to_name(num, &mut buf).unwrap();
+            assert_eq!(buf, expected);
+        };
+        check(0, b"A");
+        check(25, b"Z");
+        check(26, b"AA");
+        check(27, b"AB");
+        check(MAX_COLUMNS - 1, b"XFD");
+    }
+
+    #[test]
+    fn test_parse_reference() {
+        let check_cell =
+            |input: &[u8], row, col, abs_row, abs_col| match Reference::parse(input).unwrap() {
+                Reference::Cell {
+                    row: r,
+                    col: c,
+                    absolute_row: ar,
+                    absolute_col: ac,
+                } => {
+                    assert_eq!((r, c, ar, ac), (row, col, abs_row, abs_col));
+                }
+                _ => panic!("Expected Cell reference"),
+            };
+        let check_column = |input: &[u8], col, abs| match Reference::parse(input).unwrap() {
+            Reference::Column {
+                col: c,
+                absolute: a,
+            } => {
+                assert_eq!((c, a), (col, abs));
+            }
+            _ => panic!("Expected Column reference"),
+        };
+        let check_row = |input: &[u8], row, abs| match Reference::parse(input).unwrap() {
+            Reference::Row {
+                row: r,
+                absolute: a,
+            } => {
+                assert_eq!((r, a), (row, abs));
+            }
+            _ => panic!("Expected Row reference"),
+        };
+
+        check_cell(b"A1", 0, 0, false, false);
+        check_cell(b"$A1", 0, 0, false, true);
+        check_cell(b"A$1", 0, 0, true, false);
+        check_cell(b"$A$1", 0, 0, true, true);
+        check_cell(b"XFD1048576", MAX_ROWS - 1, MAX_COLUMNS - 1, false, false);
+        check_column(b"A", 0, false);
+        check_column(b"$A", 0, true);
+        check_column(b"XFD", MAX_COLUMNS - 1, false);
+        check_row(b"1", 0, false);
+        check_row(b"$1", 0, true);
+        check_row(b"1048576", MAX_ROWS - 1, false);
+    }
+
+    #[test]
+    fn test_replace_cell_names() {
+        assert_eq!(replace_cell_names("A1", (1, 0)).unwrap(), "A2".to_owned());
+        assert_eq!(
+            replace_cell_names("CONCATENATE(A1, \"a\")", (1, 0)).unwrap(),
+            "CONCATENATE(A2, \"a\")".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM(E:F)", (0, 1)).unwrap(),
+            "SUM(F:G)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM($E:$F)", (0, 1)).unwrap(),
+            "SUM($E:$F)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM(5:6)", (1, 0)).unwrap(),
+            "SUM(6:7)".to_owned()
+        );
+    }
+
+    #[test]
+    fn test_offset_range() {
+        let check = |input: &[u8], offset, expected: &[u8]| {
+            let mut buf = Vec::new();
+            offset_range(input, offset, &mut buf).unwrap();
+            assert_eq!(buf, expected);
+        };
+        check(b"A1", (1, 1), b"B2");
+        check(b"$A1", (1, 1), b"$A2");
+        check(b"A$1", (1, 1), b"B$1");
+        check(b"$A$1", (1, 1), b"$A$1");
+        check(b"A1:B2", (1, 1), b"B2:C3");
+        check(b"E:F", (0, 1), b"F:G");
+        check(b"5:6", (1, 0), b"6:7");
     }
 }

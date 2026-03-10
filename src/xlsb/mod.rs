@@ -24,7 +24,7 @@ use crate::datatype::DataRef;
 use crate::formats::{builtin_format_by_code, detect_custom_number_format, CellFormat};
 use crate::utils::{
     build_zip_path_cache, cached_zip_path, push_column, read_f64, read_i32, read_u16, read_u32,
-    read_usize,
+    read_usize, resolve_rel_ref, write_cell_ref,
 };
 use crate::vba::VbaProject;
 use crate::{
@@ -402,7 +402,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
                     let name = wide_str(&buf[9..len], &mut str_len)?.into_owned();
                     let rgce_len = read_u32(&buf[9 + str_len..]) as usize;
                     let rgce = &buf[13 + str_len..13 + str_len + rgce_len];
-                    let formula = parse_formula(rgce, &self.extern_sheets, &defined_names)?;
+                    let formula = parse_formula(rgce, &self.extern_sheets, &defined_names, None)?;
                     defined_names.push((name, formula));
                 }
                 0x009D | 0x0225 | 0x018D | 0x0180 | 0x009A | 0x0252 | 0x0229 | 0x009B | 0x0084 => {
@@ -731,6 +731,7 @@ fn parse_formula(
     mut rgce: &[u8],
     sheets: &[String],
     names: &[(String, String)],
+    cell_pos: Option<(u32, u32)>,
 ) -> Result<String, XlsbError> {
     if rgce.is_empty() {
         return Ok(String::new());
@@ -792,10 +793,32 @@ fn parse_formula(
                 rgce = &rgce[14..];
             }
             0x01 => {
-                // PtgExp: array/shared formula, ignore
-                debug!("ignoring PtgExp array/shared formula");
+                // PtgExp: shared/array formula (resolved by caller)
                 stack.push(formula.len());
                 rgce = &rgce[4..];
+            }
+            0x2C | 0x4C | 0x6C => {
+                // PtgRefN: relative cell reference (used in shared formulas)
+                stack.push(formula.len());
+                let pos = cell_pos.unwrap_or((0, 0));
+                let row_raw = read_u32(rgce) as i32;
+                let col_raw = read_u16(&rgce[4..]);
+                let (row, col, row_rel, col_rel) = resolve_rel_ref(row_raw, col_raw, pos);
+                write_cell_ref(&mut formula, row, col, row_rel, col_rel);
+                rgce = &rgce[6..];
+            }
+            0x2D | 0x4D | 0x6D => {
+                // PtgAreaN: relative area reference (used in shared formulas)
+                stack.push(formula.len());
+                let pos = cell_pos.unwrap_or((0, 0));
+                let (r1, c1, r1_rel, c1_rel) =
+                    resolve_rel_ref(read_u32(rgce) as i32, read_u16(&rgce[8..]), pos);
+                let (r2, c2, r2_rel, c2_rel) =
+                    resolve_rel_ref(read_u32(&rgce[4..]) as i32, read_u16(&rgce[10..]), pos);
+                write_cell_ref(&mut formula, r1, c1, r1_rel, c1_rel);
+                formula.push(':');
+                write_cell_ref(&mut formula, r2, c2, r2_rel, c2_rel);
+                rgce = &rgce[12..];
             }
             0x03..=0x11 => {
                 // binary operation
@@ -1007,7 +1030,7 @@ fn parse_formula(
             0x29 | 0x49 | 0x69 => {
                 let cce = read_u16(rgce) as usize;
                 rgce = &rgce[2..];
-                let f = parse_formula(&rgce[..cce], sheets, names)?;
+                let f = parse_formula(&rgce[..cce], sheets, names, cell_pos)?;
                 stack.push(formula.len());
                 formula.push_str(&f);
                 rgce = &rgce[cce..];
@@ -1026,6 +1049,25 @@ fn parse_formula(
         Ok(formula)
     } else {
         Err(XlsbError::StackLen)
+    }
+}
+
+/// Check if XLSB formula tokens contain a PtgExp (shared/array formula reference).
+/// Returns the host row if found (XLSB PtgExp has no column).
+#[inline]
+fn find_ptgexp(rgce: &[u8]) -> Option<u32> {
+    if rgce.len() < 5 {
+        return None;
+    }
+    let mut pos = 0;
+    // Skip any leading PtgAttrSpace (0x19) tokens.
+    while pos + 4 <= rgce.len() && rgce[pos] == 0x19 {
+        pos += 4;
+    }
+    if pos + 5 <= rgce.len() && rgce[pos] == 0x01 {
+        Some(read_u32(&rgce[pos + 1..]))
+    } else {
+        None
     }
 }
 

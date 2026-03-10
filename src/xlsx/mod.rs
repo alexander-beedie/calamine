@@ -25,7 +25,7 @@ use zip::result::ZipError;
 use crate::datatype::DataRef;
 use crate::formats::{builtin_format_by_id, detect_custom_number_format, CellFormat};
 use crate::utils::{
-    build_zip_path_cache, cached_zip_path, unescape_entity_to_buffer, unescape_xml,
+    build_zip_path_cache, cached_zip_path, unescape_entity_to_buffer, unescape_xml, CellRefError,
 };
 use crate::vba::VbaProject;
 use crate::{
@@ -37,10 +37,10 @@ pub use cells_reader::XlsxCellReader;
 pub(crate) type XlReader<'a, RS> = XmlReader<BufReader<ZipFile<'a, RS>>>;
 
 /// Maximum number of rows allowed in an XLSX file.
-pub const MAX_ROWS: u32 = 1_048_576;
+pub const MAX_ROWS: u32 = crate::utils::MAX_ROWS;
 
 /// Maximum number of columns allowed in an XLSX file.
-pub const MAX_COLUMNS: u32 = 16_384;
+pub const MAX_COLUMNS: u32 = crate::utils::MAX_COLUMNS;
 
 /// An enum for Xlsx specific errors.
 #[derive(Debug)]
@@ -158,6 +158,17 @@ from_err!(std::num::ParseFloatError, XlsxError, ParseFloat);
 from_err!(std::num::ParseIntError, XlsxError, ParseInt);
 from_err!(quick_xml::encoding::EncodingError, XlsxError, Encoding);
 from_err!(quick_xml::events::attributes::AttrError, XlsxError, XmlAttr);
+
+impl From<CellRefError> for XlsxError {
+    fn from(e: CellRefError) -> Self {
+        match e {
+            CellRefError::Alphanumeric(c) => XlsxError::Alphanumeric(c),
+            CellRefError::ColumnNumberOverflow => XlsxError::ColumnNumberOverflow,
+            CellRefError::RowNumberOverflow => XlsxError::RowNumberOverflow,
+            CellRefError::Unexpected(msg) => XlsxError::Unexpected(msg),
+        }
+    }
+}
 
 impl std::fmt::Display for XlsxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2003,308 +2014,6 @@ where
     Ok(merge_cells)
 }
 
-#[derive(Debug, Copy, Clone)]
-enum Reference {
-    Cell {
-        row: u32,
-        col: u32,
-        absolute_row: bool,
-        absolute_col: bool,
-    },
-    Row {
-        row: u32,
-        absolute: bool,
-    },
-    Column {
-        col: u32,
-        absolute: bool,
-    },
-}
-
-impl Reference {
-    // Create a cell reference with validation.
-    fn cell(row: u32, col: u32, absolute_row: bool, absolute_col: bool) -> Result<Self, XlsxError> {
-        let reference = Reference::Cell {
-            row,
-            col,
-            absolute_row,
-            absolute_col,
-        };
-        reference.validate()?;
-        Ok(reference)
-    }
-
-    // Create a column reference with validation.
-    fn column(col: u32, absolute: bool) -> Result<Self, XlsxError> {
-        let reference = Reference::Column { col, absolute };
-        reference.validate()?;
-        Ok(reference)
-    }
-
-    // Create a row reference with validation.
-    fn row(row: u32, absolute: bool) -> Result<Self, XlsxError> {
-        let reference = Reference::Row { row, absolute };
-        reference.validate()?;
-        Ok(reference)
-    }
-
-    // Parse a reference (e.g., "A1", "$A1", "A$1", "$A$1", "E", "$E", "5", "$5").
-    fn parse(name: &[u8]) -> Result<Self, XlsxError> {
-        let mut iter = name.iter().peekable();
-        let mut col: u32 = 0;
-        let mut row: u32 = 0;
-        let mut absolute_col = false;
-        let mut absolute_row = false;
-
-        while let Some(&c) = iter.next() {
-            match (c, iter.peek()) {
-                (b'$', Some(b'A'..=b'Z' | b'a'..=b'z')) => {
-                    if row > 0 || col > 0 {
-                        return Err(XlsxError::Alphanumeric(c));
-                    }
-                    absolute_col = true;
-                }
-                (b'$', Some(b'0'..=b'9')) => {
-                    if row > 0 {
-                        return Err(XlsxError::Alphanumeric(c));
-                    }
-                    absolute_row = true;
-                }
-                (b'$', _) => return Err(XlsxError::Alphanumeric(c)),
-                (c @ (b'A'..=b'Z' | b'a'..=b'z'), _) => {
-                    if row > 0 {
-                        return Err(XlsxError::Alphanumeric(c));
-                    }
-                    col = col
-                        .wrapping_mul(26)
-                        .wrapping_add((c.to_ascii_uppercase() - b'A') as u32 + 1);
-                }
-                (c @ b'0'..=b'9', _) => {
-                    row = row.wrapping_mul(10).wrapping_add((c - b'0') as u32);
-                }
-                _ => return Err(XlsxError::Alphanumeric(c)),
-            }
-        }
-
-        match (col.checked_sub(1), row.checked_sub(1)) {
-            (Some(col), Some(row)) => Reference::cell(row, col, absolute_row, absolute_col),
-            (Some(col), None) => Reference::column(col, absolute_col),
-            (None, Some(row)) => Reference::row(row, absolute_row),
-            (None, None) => Err(XlsxError::Unexpected("Empty reference")),
-        }
-    }
-
-    // Apply offset to create a new reference with validation.
-    fn offset(self, offset: (i64, i64)) -> Result<Self, XlsxError> {
-        let result = match self {
-            Reference::Cell {
-                row,
-                col,
-                absolute_row,
-                absolute_col,
-            } => {
-                let new_col = if absolute_col {
-                    col
-                } else {
-                    (col as i64 + offset.1) as u32
-                };
-                let new_row = if absolute_row {
-                    row
-                } else {
-                    (row as i64 + offset.0) as u32
-                };
-
-                Reference::Cell {
-                    row: new_row,
-                    col: new_col,
-                    absolute_row,
-                    absolute_col,
-                }
-            }
-            Reference::Column { col, absolute } => {
-                let new_col = if absolute {
-                    col
-                } else {
-                    (col as i64 + offset.1) as u32
-                };
-
-                Reference::Column {
-                    col: new_col,
-                    absolute,
-                }
-            }
-            Reference::Row { row, absolute } => {
-                let new_row = if absolute {
-                    row
-                } else {
-                    (row as i64 + offset.0) as u32
-                };
-
-                Reference::Row {
-                    row: new_row,
-                    absolute,
-                }
-            }
-        };
-
-        result.validate()?;
-        Ok(result)
-    }
-
-    // Validate that row/column values are in bounds.
-    fn validate(&self) -> Result<(), XlsxError> {
-        match self {
-            Reference::Cell { row, col, .. } => {
-                if *col >= MAX_COLUMNS {
-                    return Err(XlsxError::ColumnNumberOverflow);
-                }
-                if *row >= MAX_ROWS {
-                    return Err(XlsxError::RowNumberOverflow);
-                }
-                Ok(())
-            }
-            Reference::Column { col, .. } => {
-                if *col >= MAX_COLUMNS {
-                    return Err(XlsxError::ColumnNumberOverflow);
-                }
-                Ok(())
-            }
-            Reference::Row { row, .. } => {
-                if *row >= MAX_ROWS {
-                    return Err(XlsxError::RowNumberOverflow);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    // Format a reference to bytes.
-    fn format(&self, buf: &mut Vec<u8>) -> Result<(), XlsxError> {
-        match self {
-            Reference::Cell {
-                row,
-                col,
-                absolute_row,
-                absolute_col,
-            } => {
-                if *absolute_col {
-                    buf.push(b'$');
-                }
-                column_number_to_name(*col, buf)?;
-                if *absolute_row {
-                    buf.push(b'$');
-                }
-                buf.extend((row + 1).to_string().into_bytes());
-                Ok(())
-            }
-            Reference::Column { col, absolute } => {
-                if *absolute {
-                    buf.push(b'$');
-                }
-                column_number_to_name(*col, buf)
-            }
-            Reference::Row { row, absolute } => {
-                if *absolute {
-                    buf.push(b'$');
-                }
-                buf.extend((row + 1).to_string().into_bytes());
-                Ok(())
-            }
-        }
-    }
-}
-
-// Advance a reference by the offset (e.g., "A1", "E:F", "5:6", "A1:B5").
-fn offset_range(range: &[u8], offset: (i64, i64), buf: &mut Vec<u8>) -> Result<(), XlsxError> {
-    let colon_pos = range.iter().position(|&b| b == b':');
-
-    match colon_pos {
-        None => {
-            let reference = Reference::parse(range)?;
-            if !matches!(reference, Reference::Cell { .. }) {
-                return Err(XlsxError::Unexpected("Single reference type must be cell"));
-            }
-            let offset_ref = reference.offset(offset)?;
-            offset_ref.format(buf)
-        }
-        Some(idx) => {
-            let start = &range[..idx];
-            let end = &range[idx + 1..];
-
-            let start_ref = Reference::parse(start)?;
-            let end_ref = Reference::parse(end)?;
-
-            if std::mem::discriminant(&start_ref) != std::mem::discriminant(&end_ref) {
-                return Err(XlsxError::Unexpected("Range type mismatch"));
-            }
-
-            let start_offset = start_ref.offset(offset)?;
-            let end_offset = end_ref.offset(offset)?;
-
-            start_offset.format(buf)?;
-            buf.push(b':');
-            end_offset.format(buf)
-        }
-    }
-}
-
-// Advance all valid cell names in the string by the offset.
-fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> {
-    let bytes = s.as_bytes();
-    let mut res: Vec<u8> = Vec::new();
-    let mut in_quote = false;
-
-    let mut token_start = 0;
-    let mut token_end = 0;
-
-    for (i, &c) in bytes.iter().enumerate() {
-        if !in_quote && (c.is_ascii_alphanumeric() || c == b'$' || c == b':') {
-            token_end = i + 1;
-        } else {
-            if token_start < token_end
-                && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
-            {
-                res.extend(&bytes[token_start..token_end]);
-            }
-            res.push(c);
-            token_start = i + 1;
-            token_end = i + 1;
-
-            if c == b'"' {
-                in_quote = !in_quote;
-            }
-        }
-    }
-
-    if token_start < token_end
-        && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
-    {
-        res.extend(&bytes[token_start..token_end]);
-    }
-
-    match String::from_utf8(res) {
-        Ok(s) => Ok(s),
-        Err(_) => Err(XlsxError::Unexpected("fail to convert cell name")),
-    }
-}
-
-/// Convert the integer to Excelsheet column title.
-/// If the column number not in 1~16384, an Error is returned.
-pub(crate) fn column_number_to_name(num: u32, buf: &mut Vec<u8>) -> Result<(), XlsxError> {
-    if num >= MAX_COLUMNS {
-        return Err(XlsxError::ColumnNumberOverflow);
-    }
-    let start = buf.len();
-    let mut num = num + 1;
-    while num > 0 {
-        let integer = ((num - 1) % 26 + 65) as u8;
-        buf.push(integer);
-        num = (num - 1) / 26;
-    }
-    buf[start..].reverse();
-    Ok(())
-}
-
 // Data type of the record's value.
 enum Tag {
     // String
@@ -2987,6 +2696,9 @@ impl<'a, RS: Read + Seek + 'a> Iterator for PivotCacheIter<'a, RS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::{
+        column_number_to_name, offset_range, replace_cell_names, CellRefError, Reference,
+    };
     use std::io::Write;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
@@ -3171,7 +2883,7 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(XlsxError::ColumnNumberOverflow) | Err(XlsxError::RowNumberOverflow)
+                    Err(CellRefError::ColumnNumberOverflow) | Err(CellRefError::RowNumberOverflow)
                 ),
                 "expected overflow error, got {:?}",
                 result
@@ -3268,19 +2980,19 @@ mod tests {
         let check_col_err = |input: &[u8]| {
             assert!(matches!(
                 Reference::parse(input),
-                Err(XlsxError::ColumnNumberOverflow)
+                Err(CellRefError::ColumnNumberOverflow)
             ));
         };
         let check_row_err = |input: &[u8]| {
             assert!(matches!(
                 Reference::parse(input),
-                Err(XlsxError::RowNumberOverflow)
+                Err(CellRefError::RowNumberOverflow)
             ));
         };
         let check_syntax_err = |input: &[u8]| {
             assert!(matches!(
                 Reference::parse(input),
-                Err(XlsxError::Alphanumeric(_))
+                Err(CellRefError::Alphanumeric(_))
             ));
         };
 
@@ -3316,14 +3028,14 @@ mod tests {
             let mut buf = Vec::new();
             assert!(matches!(
                 offset_range(input, offset, &mut buf),
-                Err(XlsxError::ColumnNumberOverflow)
+                Err(CellRefError::ColumnNumberOverflow)
             ));
         };
         let check_row_err = |input: &[u8], offset| {
             let mut buf = Vec::new();
             assert!(matches!(
                 offset_range(input, offset, &mut buf),
-                Err(XlsxError::RowNumberOverflow)
+                Err(CellRefError::RowNumberOverflow)
             ));
         };
 
